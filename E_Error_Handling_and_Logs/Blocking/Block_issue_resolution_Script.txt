@@ -1,0 +1,130 @@
+--- Check current active sessions
+
+sp_who2 active
+
+--- check blocking sessions 
+
+select * from sys.sysprocesses where spid > 50 and blocked <> 0;
+
+--- check open transaction  
+
+dbcc opentran()
+
+--- check what code is executed  
+
+dbcc inputbuffer(spid)
+
+--- check who executed the query  
+
+sp_who2 spid ---  sp_who2 70
+
+
+---Query to get blocking tree to find header blockers
+
+SET NOCOUNT ON
+GO
+SELECT SPID, BLOCKED, REPLACE (REPLACE (T.TEXT, CHAR(10), ' '), CHAR (13), ' ' ) AS BATCH
+INTO #tmpProcess
+FROM sys.sysprocesses R CROSS APPLY sys.dm_exec_sql_text(R.SQL_HANDLE) T
+GO
+WITH BLOCKERProcess (SPID, BLOCKED, LEVEL, BATCH)
+AS
+(
+SELECT SPID,
+BLOCKED,
+CAST (REPLICATE ('0', 4-LEN (CAST (SPID AS VARCHAR))) + CAST (SPID AS VARCHAR) AS VARCHAR (1000)) AS LEVEL,
+BATCH FROM #tmpProcess R
+WHERE (BLOCKED = 0 OR BLOCKED = SPID)
+AND EXISTS (SELECT * FROM #tmpProcess R2 WHERE R2.BLOCKED = R.SPID AND R2.BLOCKED <> R2.SPID)
+UNION ALL
+SELECT R.SPID,
+R.BLOCKED,
+CAST (BLOCKERProcess.LEVEL + RIGHT (CAST ((1000 + R.SPID) AS VARCHAR (100)), 4) AS VARCHAR (1000)) AS LEVEL,
+R.BATCH FROM #tmpProcess AS R
+INNER JOIN BLOCKERProcess ON R.BLOCKED = BLOCKERProcess.SPID WHERE R.BLOCKED > 0 AND R.BLOCKED <> R.SPID
+)
+SELECT N'    ' + REPLICATE (N'|         ', LEN (LEVEL)/4 - 1) +
+CASE WHEN (LEN(LEVEL)/4 - 1) = 0
+THEN 'HEAD -  '
+ELSE '|------  ' END
++ CAST (SPID AS NVARCHAR (10)) + N' ' + BATCH AS BLOCKING_TREE
+FROM BLOCKERProcess ORDER BY LEVEL ASC
+GO
+DROP TABLE #tmpProcess
+GO
+
+
+---- Updated blocking tree query
+
+
+SET NOCOUNT ON;
+
+-- Capture execution context
+DECLARE @ExecutedBy SYSNAME = ORIGINAL_LOGIN();
+DECLARE @HostName NVARCHAR(128) = HOST_NAME();
+DECLARE @AppName NVARCHAR(128) = PROGRAM_NAME();
+DECLARE @ExecutedOn DATETIME = GETDATE();
+
+-- Step 1: Gather process info
+IF OBJECT_ID('tempdb..#tmpProcess') IS NOT NULL
+    DROP TABLE #tmpProcess;
+
+SELECT  
+    R.spid,  
+    R.blocked,  
+    LEFT(REPLACE(REPLACE(ISNULL(T.text, '<no sql text>'), CHAR(10), ' '), CHAR(13), ' '), 300) AS Batch
+INTO #tmpProcess
+FROM sys.sysprocesses R
+OUTER APPLY sys.dm_exec_sql_text(R.sql_handle) T;
+
+-- Step 2: Build recursive tree
+;WITH BLOCKERProcess (SPID, BLOCKED, LEVEL, BATCH)
+AS
+(
+    -- Head blockers
+    SELECT  
+        SPID,
+        BLOCKED,
+        CAST(REPLICATE('0', 4 - LEN(CAST(SPID AS VARCHAR(10)))) + CAST(SPID AS VARCHAR(10)) AS VARCHAR(1000)) AS LEVEL,
+        BATCH
+    FROM #tmpProcess R
+    WHERE (BLOCKED = 0 OR BLOCKED = SPID)
+          AND EXISTS (
+              SELECT 1
+              FROM #tmpProcess R2
+              WHERE R2.blocked = R.spid
+                    AND R2.blocked <> R2.spid
+          )
+
+    UNION ALL
+
+    -- Recursive part (blocked sessions)
+    SELECT  
+        R.SPID,
+        R.BLOCKED,
+        CAST(BLOCKERProcess.LEVEL + RIGHT(CAST((1000 + R.SPID) AS VARCHAR(100)), 4) AS VARCHAR(1000)) AS LEVEL,
+        R.BATCH
+    FROM #tmpProcess AS R
+    INNER JOIN BLOCKERProcess
+        ON R.blocked = BLOCKERProcess.SPID
+    WHERE R.blocked > 0
+          AND R.blocked <> R.SPID
+)
+-- Step 3: Combine execution info + blocking tree in one result
+SELECT 
+    CASE 
+        WHEN (LEN(LEVEL) / 4 - 1) = 0 
+            THEN 'HEAD -  ' 
+        ELSE '|------  ' 
+    END
+    + CAST(SPID AS NVARCHAR(10)) AS [SPID],
+    BLOCKED AS [Blocked By],
+    BATCH AS [Executing SQL Text],
+    @ExecutedBy AS [Script Executed By],
+    @HostName AS [Host Name],
+    @AppName AS [Application Name],
+    CONVERT(VARCHAR(30), @ExecutedOn, 120) AS [Executed On]
+FROM BLOCKERProcess
+ORDER BY LEVEL ASC;
+
+DROP TABLE #tmpProcess;
